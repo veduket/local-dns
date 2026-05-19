@@ -567,6 +567,8 @@ fn cmd_init() -> Result<String, String> {
             eprintln!("  {} {e}", "⚠".yellow());
             println!("\n  To configure manually:\n  {c}\n");
         }
+    } else {
+        println!("  {} To route .test/.dev domains to dnsmasq, set your system DNS to 127.0.0.1:5354", "ℹ".yellow());
     }
 
     println!("{}", "────────────────────────────────────────────".dimmed());
