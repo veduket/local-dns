@@ -37,7 +37,7 @@ fn log_path() -> PathBuf {
 
 fn collect_tool_stats() -> Vec<(&'static str, String)> {
     let mut stats: Vec<(&'static str, String)> = Vec::new();
-    if let Ok(conn) = open_db() {
+    if let Ok(conn) = open_db_readonly() {
         if let Ok(n) = conn.query_row("SELECT COUNT(*) FROM zones", [], |r| r.get::<_, i64>(0)) {
             stats.push(("zones", n.to_string()));
         }
@@ -290,6 +290,13 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
 
 fn db_path() -> PathBuf { data_dir().join("local-dns.db") }
 
+fn open_db_readonly() -> Result<Connection, String> {
+    Connection::open_with_flags(
+        db_path(),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    ).map_err(|e| format!("Cannot open database: {e}"))
+}
+
 fn open_db() -> Result<Connection, String> {
     let conn = Connection::open(db_path()).map_err(|e| format!("Cannot open database: {e}"))?;
     conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA foreign_keys=ON;").map_err(|e| format!("{e}"))?;
@@ -532,18 +539,20 @@ fn start_service_hint() -> String {
 // ═══════════════════════════════════════════════════════════
 
 fn handle_zone(action: ZoneAction) -> Result<String, String> {
-    let conn = open_db()?; let p = active_profile(&conn)?;
     match action {
         ZoneAction::Create { name, display } => {
+            let conn = open_db()?; let p = active_profile(&conn)?;
             conn.execute("INSERT INTO zones (profile_id, name, display_name) VALUES (?1, ?2, ?3)", params![p.id, name, display])
                 .map_err(|e| if e.to_string().contains("UNIQUE") { format!("Zone '{name}' exists") } else { format!("{e}") })?;
             Ok(format!("{} Zone '{name}' created", "✓".green()))
         }
         ZoneAction::List => {
+            let conn = open_db_readonly()?; let p = active_profile(&conn)?;
             let z = zone_list(&conn, p.id)?; if z.is_empty() { return Ok(format!("{}", "No zones.".yellow())); }
             Ok(format!("{}:\n{}", "Zones".bold(), z.iter().map(|(n, d)| format!("  {}{}", n, d.as_deref().map(|s| format!(" ({})", s.cyan())).unwrap_or_default())).collect::<Vec<_>>().join("\n")))
         }
         ZoneAction::Show { name } => {
+            let conn = open_db_readonly()?; let p = active_profile(&conn)?;
             let zid = resolve_zone(&conn, p.id, &name)?;
             let dsp: Option<String> = conn.query_row("SELECT display_name FROM zones WHERE id = ?1", params![zid], |row| row.get(0)).ok().flatten();
             let grps = group_list(&conn, zid)?;
@@ -554,6 +563,7 @@ fn handle_zone(action: ZoneAction) -> Result<String, String> {
             Ok(out.trim().into())
         }
         ZoneAction::Delete { name } => {
+            let conn = open_db()?; let p = active_profile(&conn)?;
             let zid = resolve_zone(&conn, p.id, &name)?;
             conn.execute("DELETE FROM zones WHERE id = ?1", params![zid]).ok();
             Ok(format!("{} Zone '{name}' deleted", "✓".green()))
@@ -562,15 +572,16 @@ fn handle_zone(action: ZoneAction) -> Result<String, String> {
 }
 
 fn handle_group(action: GroupAction) -> Result<String, String> {
-    let conn = open_db()?; let p = active_profile(&conn)?;
     match action {
         GroupAction::Create { name, zone, display } => {
+            let conn = open_db()?; let p = active_profile(&conn)?;
             let zid = resolve_zone(&conn, p.id, &zone)?;
             conn.execute("INSERT INTO groups (zone_id, name, display_name) VALUES (?1, ?2, ?3)", params![zid, name, display])
                 .map_err(|e| if e.to_string().contains("UNIQUE") { format!("Group '{name}' exists in '{zone}'") } else { format!("{e}") })?;
             Ok(format!("{} Group '{name}' created in '{zone}'", "✓".green()))
         }
         GroupAction::List { zone } => {
+            let conn = open_db_readonly()?; let p = active_profile(&conn)?;
             if let Some(z) = zone {
                 let zid = resolve_zone(&conn, p.id, &z)?;
                 let grps = group_list(&conn, zid)?;
@@ -583,6 +594,7 @@ fn handle_group(action: GroupAction) -> Result<String, String> {
             }
         }
         GroupAction::Delete { name, zone } => {
+            let conn = open_db()?; let p = active_profile(&conn)?;
             let zid = resolve_zone(&conn, p.id, &zone)?;
             conn.execute("DELETE FROM groups WHERE zone_id = ?1 AND name = ?2", params![zid, name]).ok();
             Ok(format!("{} Group '{name}' deleted from '{zone}'", "✓".green()))
@@ -710,7 +722,7 @@ fn edit_entry(domain: &str, ip: Option<&str>, comment: Option<&str>) -> Result<S
 }
 
 fn list_entries() -> Result<String, String> {
-    let conn = open_db()?; let p = active_profile(&conn)?; let entries = all_entries(&conn, p.id)?;
+    let conn = open_db_readonly()?; let p = active_profile(&conn)?; let entries = all_entries(&conn, p.id)?;
     if entries.is_empty() {
         let zs = zone_list(&conn, p.id)?;
         if zs.is_empty() { return Ok(format!("{} Use `local-dns add myapp.test 127.0.0.1`", "No entries.".yellow())); }
@@ -736,7 +748,7 @@ fn list_entries() -> Result<String, String> {
 }
 
 fn cmd_check(domain: &str) -> Result<String, String> {
-    let conn = open_db()?;
+    let conn = open_db_readonly()?;
     let p = active_profile(&conn)?;
 
     if domain == "all" {
@@ -803,10 +815,13 @@ fn is_entry_loaded(domain: &str) -> bool {
 // ═══════════════════════════════════════════════════════════
 
 fn handle_profile(action: ProfileAction) -> Result<String, String> {
-    let conn = open_db()?;
     match action {
-        ProfileAction::Show => Ok(format!("{} {}", "Active profile:".cyan().bold(), active_profile(&conn)?.name.green().bold())),
+        ProfileAction::Show => {
+            let conn = open_db_readonly()?;
+            Ok(format!("{} {}", "Active profile:".cyan().bold(), active_profile(&conn)?.name.green().bold()))
+        }
         ProfileAction::Switch { name } => {
+            let conn = open_db()?;
             let exists: bool = conn.query_row("SELECT COUNT(*) FROM profiles WHERE name = ?1", params![name], |row| row.get::<_, i64>(0)).unwrap_or(0) > 0;
             if !exists { return Err(format!("Profile '{name}' not found")); }
             conn.execute("UPDATE profiles SET is_active = 0", []).ok();
@@ -814,17 +829,20 @@ fn handle_profile(action: ProfileAction) -> Result<String, String> {
             cmd_apply()?; Ok(format!("{} Switched to '{name}'", "➜".green().bold()))
         }
         ProfileAction::Create { name } => {
+            let conn = open_db()?;
             conn.execute("INSERT INTO profiles (name) VALUES (?1)", params![name])
                 .map_err(|e| if e.to_string().contains("UNIQUE") { format!("Profile '{name}' exists") } else { format!("{e}") })?;
             Ok(format!("{} Profile '{name}' created", "✓".green()))
         }
         ProfileAction::List => {
+            let conn = open_db_readonly()?;
             let n = profile_names(&conn)?;
             Ok(if n.is_empty() { "No profiles.".yellow().to_string() } else {
                 format!("{}:\n{}", "Profiles".bold(), n.iter().map(|x| format!("  {x}")).collect::<Vec<_>>().join("\n"))
             })
         }
         ProfileAction::Delete { name } => {
+            let conn = open_db()?;
             if name == active_profile(&conn)?.name { return Err("Cannot delete active profile".into()); }
             conn.execute("DELETE FROM profiles WHERE name = ?1", params![name]).ok();
             Ok(format!("{} Profile '{name}' deleted", "✓".green()))
@@ -884,7 +902,7 @@ fn cmd_status() -> Result<String, String> {
     if let Some(ref s) = state {
         for svc in &s.services { out.push_str(&format!("  {}: {}\n", svc.cyan(), "running".green())); }
     }
-    if let Ok(conn) = open_db() {
+    if let Ok(conn) = open_db_readonly() {
         if let Ok(p) = active_profile(&conn) {
             out.push_str(&format!("\n{} {}\n", "Profile:".cyan().bold(), p.name.bold()));
             if let Ok(zs) = zone_list(&conn, p.id) {
