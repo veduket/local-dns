@@ -462,6 +462,42 @@ fn resolved_routing_snippet() -> String {
     "# Make queries for custom TLDs reach local dnsmasq:\n# resolvectl dns lo 127.0.0.1\n# resolvectl domain lo '~test' '~dev' '~local' '~localhost'".into()
 }
 
+fn configure_resolved_routing() -> Result<(), String> {
+    let conf_dir = Path::new("/etc/systemd/resolved.conf.d");
+    fs::create_dir_all(conf_dir).map_err(|e| format!("Cannot create {conf_dir:?}: {e}"))?;
+    let conf = r#"# Managed by local-dns — local development DNS routing
+[Resolve]
+DNS=127.0.0.1:5354
+Domains=~test ~dev ~local ~localhost ~invalid
+"#;
+    let path = conf_dir.join("local-dns.conf");
+    fs::write(&path, conf).map_err(|e| format!("Cannot write {path:?}: {e}"))?;
+    println!("  {} Created {}", "✓".green(), path.display().to_string().cyan());
+
+    let restart = Command::new("systemctl")
+        .args(["try-reload-or-restart", "systemd-resolved"])
+        .status()
+        .map_err(|e| format!("Cannot restart systemd-resolved: {e}"))?;
+    if restart.success() {
+        println!("  {} Restarted systemd-resolved", "✓".green());
+    } else {
+        eprintln!("  {} Failed to restart systemd-resolved", "⚠".yellow());
+    }
+
+    // Also apply immediately via resolvectl so it works without reboot
+    let dns_set = Command::new("resolvectl")
+        .args(["dns", "lo", "127.0.0.1:5354"])
+        .status();
+    let domain_set = Command::new("resolvectl")
+        .args(["domain", "lo", "~test", "~dev", "~local", "~localhost", "~invalid"])
+        .status();
+    if dns_set.ok().map_or(false, |s| s.success()) && domain_set.ok().map_or(false, |s| s.success()) {
+        println!("  {} Applied resolvectl routing", "✓".green());
+    }
+
+    Ok(())
+}
+
 fn format_detect(state: &SystemState) -> String {
     let mut out = String::new();
     out.push_str(&format!("{} {}\n\n", "Platform:".cyan().bold(), std::env::consts::OS));
@@ -526,7 +562,11 @@ fn cmd_init() -> Result<String, String> {
         println!("{}\n\n{s}\n\n{}\n", "Add to /etc/dnsdist/dnsdist.conf:".yellow(), "Then: sudo systemctl restart dnsdist".yellow());
     }
     if let Some(ref c) = state.resolved_conf {
-        println!("{}\n\n{c}\n", "systemd-resolved detected!".yellow().bold());
+        println!("{}", "systemd-resolved detected! Configuring routing...".yellow().bold());
+        if let Err(e) = configure_resolved_routing() {
+            eprintln!("  {} {e}", "⚠".yellow());
+            println!("\n  To configure manually:\n  {c}\n");
+        }
     }
 
     println!("{}", "────────────────────────────────────────────".dimmed());
