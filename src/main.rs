@@ -596,9 +596,15 @@ fn handle_group(action: GroupAction) -> Result<String, String> {
 
 fn add_entry(domain: &str, ip: &str, zone: Option<&str>, group: Option<&str>, comment: Option<&str>) -> Result<String, String> {
     let conn = open_db()?; let p = active_profile(&conn)?; let (_, def_gid) = ensure_defaults(&conn)?;
-    let zn = zone.unwrap_or("global"); let gn = group.unwrap_or("main");
+    let zn = zone.unwrap_or("global");
+    let gn = group.unwrap_or("main");
     let zid = if zn == "global" { conn.query_row("SELECT id FROM zones WHERE profile_id = ?1 AND name = 'global'", params![p.id], |row| row.get(0)).unwrap() } else { resolve_zone(&conn, p.id, zn)? };
-    let gid = if gn == "main" && zn == "global" { def_gid } else { resolve_group(&conn, zid, gn)? };
+    let gid = if gn == "main" && zn == "global" { def_gid } else {
+        resolve_group(&conn, zid, gn).unwrap_or_else(|_| {
+            conn.execute("INSERT INTO groups (zone_id, name) VALUES (?1, ?2)", params![zid, gn]).map_err(|e| format!("Cannot create group '{gn}' in '{zn}': {e}")).ok();
+            conn.last_insert_rowid()
+        })
+    };
     conn.execute("INSERT INTO entries (group_id, domain, ip, comment, sort_key) VALUES (?1, ?2, ?3, ?4, ?5)",
         params![gid, domain, ip, comment, domain.trim_start_matches("*.")]).map_err(|e| {
             if e.to_string().contains("UNIQUE") { format!("Entry '{domain}' exists") } else { format!("{e}") }
@@ -620,7 +626,12 @@ fn move_entry(domain: &str, zone: Option<&str>, group: Option<&str>) -> Result<S
     let conn = open_db()?; let p = active_profile(&conn)?; let (_, def_gid) = ensure_defaults(&conn)?;
     let zn = zone.unwrap_or("global"); let gn = group.unwrap_or("main");
     let zid = if zn == "global" { conn.query_row("SELECT id FROM zones WHERE profile_id = ?1 AND name = 'global'", params![p.id], |row| row.get(0)).unwrap() } else { resolve_zone(&conn, p.id, zn)? };
-    let gid = if gn == "main" && zn == "global" { def_gid } else { resolve_group(&conn, zid, gn)? };
+    let gid = if gn == "main" && zn == "global" { def_gid } else {
+        resolve_group(&conn, zid, gn).unwrap_or_else(|_| {
+            conn.execute("INSERT INTO groups (zone_id, name) VALUES (?1, ?2)", params![zid, gn]).map_err(|e| format!("Cannot create group '{gn}' in '{zn}': {e}")).ok();
+            conn.last_insert_rowid()
+        })
+    };
 
     let entry = conn.query_row(
         "SELECT e.id, e.domain, e.ip, e.comment, e.sort_key, e.group_id FROM entries e
@@ -648,7 +659,12 @@ fn copy_entry(domain: &str, zone: Option<&str>, group: Option<&str>) -> Result<S
     let conn = open_db()?; let p = active_profile(&conn)?; let (_, def_gid) = ensure_defaults(&conn)?;
     let zn = zone.unwrap_or("global"); let gn = group.unwrap_or("main");
     let zid = if zn == "global" { conn.query_row("SELECT id FROM zones WHERE profile_id = ?1 AND name = 'global'", params![p.id], |row| row.get(0)).unwrap() } else { resolve_zone(&conn, p.id, zn)? };
-    let gid = if gn == "main" && zn == "global" { def_gid } else { resolve_group(&conn, zid, gn)? };
+    let gid = if gn == "main" && zn == "global" { def_gid } else {
+        resolve_group(&conn, zid, gn).unwrap_or_else(|_| {
+            conn.execute("INSERT INTO groups (zone_id, name) VALUES (?1, ?2)", params![zid, gn]).map_err(|e| format!("Cannot create group '{gn}' in '{zn}': {e}")).ok();
+            conn.last_insert_rowid()
+        })
+    };
 
     let entry = conn.query_row(
         "SELECT e.domain, e.ip, e.comment, e.sort_key FROM entries e
