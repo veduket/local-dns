@@ -195,6 +195,7 @@ enum Commands {
     Apply,
     Logs { #[arg(short, long)] follow: bool, #[arg(short, long)] errors: bool, #[arg(short, long, default_value = "50")] lines: usize },
     Detect,
+    Check { domain: String },
     Telemetry { #[command(subcommand)] action: TelemetryAction },
 }
 
@@ -208,7 +209,7 @@ enum ZoneAction { Create { name: String, #[arg(short, long)] display: Option<Str
 #[derive(Subcommand)]
 enum GroupAction { Create { name: String, zone: String, #[arg(short, long)] display: Option<String> }, List { #[arg(short, long)] zone: Option<String> }, Delete { name: String, zone: String } }
 
-struct Entry { domain: String, ip: String, comment: Option<String>, zone_name: String, group_name: String }
+struct Entry { domain: String, ip: String, comment: Option<String>, zone_name: String, group_name: String, created_at: String }
 struct Profile { id: i64, name: String, #[allow(dead_code)] is_active: bool }
 
 #[derive(Debug)]
@@ -248,6 +249,7 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
         Commands::Apply => "apply",
         Commands::Logs { .. } => "logs",
         Commands::Detect => "detect",
+        Commands::Check { .. } => "check",
     };
     let stats = if matches!(cmd_name, "init" | "status" | "detect") {
         vec![]
@@ -268,6 +270,7 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
         Commands::Apply => cmd_apply(),
         Commands::Logs { follow, errors, lines } => cmd_logs(follow, errors, lines),
         Commands::Detect => cmd_detect(),
+        Commands::Check { domain } => cmd_check(&domain),
         Commands::Telemetry { action } => handle_telemetry(action, tel),
     }
 }
@@ -369,12 +372,12 @@ fn group_list(conn: &Connection, zid: i64) -> Result<Vec<(String, Option<String>
 
 fn all_entries(conn: &Connection, pid: i64) -> Result<Vec<Entry>, String> {
     let mut stmt = conn.prepare(
-        "SELECT e.domain, e.ip, e.comment, z.name, g.name FROM entries e
+        "SELECT e.domain, e.ip, e.comment, z.name, g.name, e.created_at FROM entries e
          JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id
          WHERE z.profile_id = ?1 ORDER BY z.sort_order, z.name, g.sort_order, g.name, e.sort_key"
     ).map_err(|e| format!("{e}"))?;
     let r = stmt.query_map(params![pid], |row| Ok(Entry {
-        domain: row.get(0)?, ip: row.get(1)?, comment: row.get(2)?, zone_name: row.get(3)?, group_name: row.get(4)?
+        domain: row.get(0)?, ip: row.get(1)?, comment: row.get(2)?, zone_name: row.get(3)?, group_name: row.get(4)?, created_at: row.get(5)?
     })).map_err(|e| format!("{e}"))?.collect::<Result<Vec<_>, _>>().map_err(|e| format!("{e}"))?;
     Ok(r)
 }
@@ -628,6 +631,69 @@ fn list_entries() -> Result<String, String> {
         out.push_str(&format!("      {:<30} {:<15}  {}\n", e.domain.green(), e.ip.cyan(), e.comment.as_deref().unwrap_or("").dimmed()));
     }
     Ok(out)
+}
+
+fn cmd_check(domain: &str) -> Result<String, String> {
+    let conn = open_db()?;
+    let p = active_profile(&conn)?;
+
+    if domain == "all" {
+        let entries = all_entries(&conn, p.id)?;
+        if entries.is_empty() {
+            return Ok(format!("{}", "No entries found.".yellow()));
+        }
+        let mut out = String::new();
+        for e in &entries {
+            let loaded = is_entry_loaded(&e.domain);
+            let loaded_str = if loaded { "loaded ✓".green().to_string() } else { "needs apply".yellow().to_string() };
+            out.push_str(&format!("{:<30} created: {:<20} {}\n", e.domain.green(), e.created_at.cyan(), loaded_str));
+        }
+        return Ok(out);
+    }
+
+    // Specific domain
+    let entry: Option<Entry> = conn.query_row(
+        "SELECT e.domain, e.ip, e.comment, z.name, g.name, e.created_at FROM entries e
+         JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id
+         WHERE z.profile_id = ?1 AND e.domain = ?2",
+        params![p.id, domain],
+        |row| Ok(Entry {
+            domain: row.get(0)?, ip: row.get(1)?, comment: row.get(2)?,
+            zone_name: row.get(3)?, group_name: row.get(4)?, created_at: row.get(5)?
+        }),
+    ).ok();
+
+    match entry {
+        Some(e) => {
+            let loaded = is_entry_loaded(&e.domain);
+            let loaded_str = if loaded { "loaded ✓".green().to_string() } else { "needs apply".yellow().to_string() };
+            let mut out = format!("{} {}\n", "Domain:".cyan().bold(), e.domain.green());
+            out.push_str(&format!("{} {}\n", "IP:".bold(), e.ip.cyan()));
+            out.push_str(&format!("{} {}\n", "Zone:".bold(), e.zone_name));
+            out.push_str(&format!("{} {}\n", "Group:".bold(), e.group_name));
+            out.push_str(&format!("{} {}\n", "Created:".bold(), e.created_at.cyan()));
+            out.push_str(&format!("{} {}\n", "Comment:".bold(), e.comment.as_deref().unwrap_or("(none)")));
+            out.push_str(&format!("{} {}\n", "Status:".bold(), loaded_str));
+            Ok(out)
+        }
+        None => Err(format!("Entry '{domain}' not found")),
+    }
+}
+
+fn is_entry_loaded(domain: &str) -> bool {
+    let zones_conf = run_dir().join("zones.conf");
+    if !zones_conf.exists() {
+        return false;
+    }
+    fs::read_to_string(zones_conf)
+        .ok()
+        .map_or(false, |content| {
+            content.lines().any(|line| {
+                // Match address= pattern: /domain/ or /.domain/
+                let addr = format!("/{}{}", if domain.starts_with("*.") { "" } else { "" }, domain.trim_start_matches("*."));
+                line.contains(&addr)
+            })
+        })
 }
 
 // ═══════════════════════════════════════════════════════════
