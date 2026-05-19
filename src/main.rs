@@ -35,6 +35,16 @@ fn log_path() -> PathBuf {
     }
 }
 
+fn ensure_run_dir() -> Result<PathBuf, String> {
+    let r = run_dir();
+    if r.exists() && !r.is_dir() {
+        eprintln!("{} Removing stale file at {}", "⚠".yellow(), r.display().to_string().cyan());
+        fs::remove_file(&r).map_err(|e| format!("Cannot remove {}: {e}", r.display()))?;
+    }
+    fs::create_dir_all(&r).map_err(|e| format!("Cannot create {}: {e}", r.display()))?;
+    Ok(r)
+}
+
 fn collect_tool_stats() -> Vec<(&'static str, String)> {
     let mut stats: Vec<(&'static str, String)> = Vec::new();
     if let Ok(conn) = open_db_readonly() {
@@ -491,9 +501,9 @@ fn cmd_init() -> Result<String, String> {
         return Err(format!("dnsmasq not found. {hint}"));
     }
 
-    let d = data_dir(); let r = run_dir();
+    let d = data_dir();
     fs::create_dir_all(&d).map_err(|e| format!("Cannot create {d:?}: {e}"))?;
-    fs::create_dir_all(&r).map_err(|e| format!("Cannot create {r:?}: {e}"))?;
+    ensure_run_dir()?;
 
     let conn = init_db()?;
     conn.execute("INSERT OR IGNORE INTO profiles (name, is_active) VALUES ('default', 1)", []).ok();
@@ -876,7 +886,7 @@ fn handle_telemetry(action: TelemetryAction, tel: &telemetry::Telemetry) -> Resu
 
 fn cmd_apply() -> Result<String, String> {
     let conn = open_db()?; let p = active_profile(&conn)?; let entries = all_entries(&conn, p.id)?;
-    fs::create_dir_all(run_dir()).map_err(|e| format!("{e}"))?;
+    ensure_run_dir()?;
     let mut lines: Vec<String> = entries.iter().map(|e| {
         let core = if e.domain.starts_with("*.") { format!("/.{}/{}", e.domain.trim_start_matches("*."), e.ip) } else { format!("/{}/{}", e.domain, e.ip) };
         let _tag = format!("[{}]", e.group_name); // zone name is implicit from dnsmasq conf-dir structure
