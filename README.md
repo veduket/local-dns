@@ -73,6 +73,15 @@ sudo local-dns add api.kazanchis.test 127.0.0.1 -z addis_ababa -g kazanchis
 
 sudo local-dns remove myapp.test
 sudo local-dns list
+
+# Move entries between zones/groups
+sudo local-dns move myapp.test -z addis_ababa -g bole
+
+# Copy entries to another zone/group
+sudo local-dns copy myapp.test -z addis_ababa -g kazanchis
+
+# Edit entry IP or comment
+sudo local-dns edit myapp.test -i 127.0.0.2 -c "moved to new IP"
 ```
 
 ### Zones & Groups

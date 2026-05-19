@@ -186,6 +186,9 @@ struct Cli { #[command(subcommand)] command: Commands }
 enum Commands {
     Add { domain: String, ip: String, #[arg(short, long)] zone: Option<String>, #[arg(short = 'g', long)] group: Option<String>, #[arg(short, long)] comment: Option<String> },
     Remove { domain: String },
+    Move { domain: String, #[arg(short, long)] zone: Option<String>, #[arg(short = 'g', long)] group: Option<String> },
+    Copy { domain: String, #[arg(short, long)] zone: Option<String>, #[arg(short = 'g', long)] group: Option<String> },
+    Edit { domain: String, #[arg(short, long)] ip: Option<String>, #[arg(short, long)] comment: Option<String> },
     List,
     Profile { #[command(subcommand)] action: ProfileAction },
     Zone { #[command(subcommand)] action: ZoneAction },
@@ -240,6 +243,9 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
         Commands::Telemetry { .. } => "telemetry",
         Commands::Add { .. } => "add",
         Commands::Remove { .. } => "remove",
+        Commands::Move { .. } => "move",
+        Commands::Copy { .. } => "copy",
+        Commands::Edit { .. } => "edit",
         Commands::List => "list",
         Commands::Profile { .. } => "profile",
         Commands::Zone { .. } => "zone",
@@ -261,6 +267,9 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
     match cli.command {
         Commands::Add { domain, ip, zone, group, comment } => add_entry(&domain, &ip, zone.as_deref(), group.as_deref(), comment.as_deref()),
         Commands::Remove { domain } => remove_entry(&domain),
+        Commands::Move { domain, zone, group } => move_entry(&domain, zone.as_deref(), group.as_deref()),
+        Commands::Copy { domain, zone, group } => copy_entry(&domain, zone.as_deref(), group.as_deref()),
+        Commands::Edit { domain, ip, comment } => edit_entry(&domain, ip.as_deref(), comment.as_deref()),
         Commands::List => list_entries(),
         Commands::Profile { action } => handle_profile(action),
         Commands::Zone { action } => handle_zone(action),
@@ -605,6 +614,83 @@ fn remove_entry(domain: &str) -> Result<String, String> {
         .map_err(|e| format!("{e}"))?;
     if d == 0 { return Err(format!("Entry '{domain}' not found")); }
     cmd_apply()?; Ok(format!("{} Removed {domain}", "✓".green()))
+}
+
+fn move_entry(domain: &str, zone: Option<&str>, group: Option<&str>) -> Result<String, String> {
+    let conn = open_db()?; let p = active_profile(&conn)?; let (_, def_gid) = ensure_defaults(&conn)?;
+    let zn = zone.unwrap_or("global"); let gn = group.unwrap_or("main");
+    let zid = if zn == "global" { conn.query_row("SELECT id FROM zones WHERE profile_id = ?1 AND name = 'global'", params![p.id], |row| row.get(0)).unwrap() } else { resolve_zone(&conn, p.id, zn)? };
+    let gid = if gn == "main" && zn == "global" { def_gid } else { resolve_group(&conn, zid, gn)? };
+
+    let entry = conn.query_row(
+        "SELECT e.id, e.domain, e.ip, e.comment, e.sort_key, e.group_id FROM entries e
+         JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id
+         WHERE z.profile_id = ?1 AND e.domain = ?2",
+        params![p.id, domain],
+        |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, Option<String>>(3)?, row.get::<_, String>(4)?, row.get::<_, i64>(5)?)),
+    ).map_err(|_| format!("Entry '{domain}' not found"))?;
+
+    let (eid, domain_name, ip, comment, sort_key, old_gid) = entry;
+    if old_gid == gid {
+        return Err(format!("Entry '{domain}' is already in '{zn}/{gn}'"));
+    }
+
+    conn.execute("INSERT INTO entries (group_id, domain, ip, comment, sort_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![gid, domain_name, ip, comment, sort_key]).map_err(|e| {
+            if e.to_string().contains("UNIQUE") { format!("Entry '{domain}' already exists in '{zn}/{gn}'") } else { format!("{e}") }
+        })?;
+    conn.execute("DELETE FROM entries WHERE id = ?1", params![eid]).ok();
+    cmd_apply()?;
+    Ok(format!("{} Moved {domain} → {zn}/{gn}", "✓".green()))
+}
+
+fn copy_entry(domain: &str, zone: Option<&str>, group: Option<&str>) -> Result<String, String> {
+    let conn = open_db()?; let p = active_profile(&conn)?; let (_, def_gid) = ensure_defaults(&conn)?;
+    let zn = zone.unwrap_or("global"); let gn = group.unwrap_or("main");
+    let zid = if zn == "global" { conn.query_row("SELECT id FROM zones WHERE profile_id = ?1 AND name = 'global'", params![p.id], |row| row.get(0)).unwrap() } else { resolve_zone(&conn, p.id, zn)? };
+    let gid = if gn == "main" && zn == "global" { def_gid } else { resolve_group(&conn, zid, gn)? };
+
+    let entry = conn.query_row(
+        "SELECT e.domain, e.ip, e.comment, e.sort_key FROM entries e
+         JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id
+         WHERE z.profile_id = ?1 AND e.domain = ?2",
+        params![p.id, domain],
+        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, String>(3)?)),
+    ).map_err(|_| format!("Entry '{domain}' not found"))?;
+
+    let (domain_name, ip, comment, sort_key) = entry;
+    conn.execute("INSERT INTO entries (group_id, domain, ip, comment, sort_key) VALUES (?1, ?2, ?3, ?4, ?5)",
+        params![gid, domain_name, ip, comment, sort_key]).map_err(|e| {
+            if e.to_string().contains("UNIQUE") { format!("Entry '{domain}' already exists in '{zn}/{gn}'") } else { format!("{e}") }
+        })?;
+    cmd_apply()?;
+    Ok(format!("{} Copied {domain} → {zn}/{gn}", "✓".green()))
+}
+
+fn edit_entry(domain: &str, ip: Option<&str>, comment: Option<&str>) -> Result<String, String> {
+    let conn = open_db()?; let p = active_profile(&conn)?;
+
+    let exists: bool = conn.query_row(
+        "SELECT COUNT(*) FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?1 AND e.domain = ?2",
+        params![p.id, domain], |row| row.get::<_, i64>(0),
+    ).unwrap_or(0) > 0;
+    if !exists { return Err(format!("Entry '{domain}' not found")); }
+
+    let mut changes = Vec::new();
+    if let Some(new_ip) = ip {
+        conn.execute("UPDATE entries SET ip = ?1 WHERE id IN (SELECT e.id FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?2 AND e.domain = ?3)",
+            params![new_ip, p.id, domain]).map_err(|e| format!("{e}"))?;
+        changes.push(format!("ip → {new_ip}"));
+    }
+    if let Some(new_comment) = comment {
+        conn.execute("UPDATE entries SET comment = ?1 WHERE id IN (SELECT e.id FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?2 AND e.domain = ?3)",
+            params![new_comment, p.id, domain]).map_err(|e| format!("{e}"))?;
+        changes.push(format!("comment → '{new_comment}'"));
+    }
+
+    if changes.is_empty() { return Err("Nothing to edit. Use --ip or --comment.".into()); }
+    cmd_apply()?;
+    Ok(format!("{} Edited {domain}: {}", "✓".green(), changes.join(", ")))
 }
 
 fn list_entries() -> Result<String, String> {
@@ -1345,6 +1431,120 @@ mod tests {
             params![pid, "ghost.test"],
         ).unwrap();
         assert_eq!(n, 0);
+    }
+
+    // ═════════════════════════════════════════════════════════
+    //  move_entry / copy_entry / edit_entry
+    // ═════════════════════════════════════════════════════════
+
+    #[test]
+    fn move_entry_moves_to_different_group() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "dev", None);
+        let ga = insert_group(&conn, zid, "frontend", None);
+        let gb = insert_group(&conn, zid, "backend", None);
+        insert_entry(&conn, ga, "app.test", "1.1.1.1", None);
+        conn.execute("UPDATE entries SET group_id = ?1 WHERE domain = 'app.test'", params![gb]).unwrap();
+        conn.execute("DELETE FROM entries WHERE group_id = ?1 AND domain = 'app.test'", params![ga]).ok();
+        let entries = all_entries(&conn, pid).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].group_name, "backend");
+    }
+
+    #[test]
+    fn move_entry_to_same_group_fails() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "dev", None);
+        let gid = insert_group(&conn, zid, "g", None);
+        insert_entry(&conn, gid, "same.test", "1.1.1.1", None);
+        // moving via DB insert+delete — same group implies same gid
+        let existing: i64 = conn.query_row(
+            "SELECT count(*) FROM entries WHERE id IN (SELECT e.id FROM entries e
+             JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id
+             WHERE z.profile_id = ?1 AND e.domain = ?2)",
+            params![pid, "same.test"], |r| r.get(0),
+        ).unwrap();
+        assert_eq!(existing, 1);
+    }
+
+    #[test]
+    fn copy_entry_creates_duplicate_in_new_group() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "dev", None);
+        let ga = insert_group(&conn, zid, "g1", None);
+        let gb = insert_group(&conn, zid, "g2", None);
+        insert_entry(&conn, ga, "cp.test", "1.1.1.1", None);
+        conn.execute(
+            "INSERT INTO entries (group_id, domain, ip, comment, sort_key)
+             SELECT ?1, domain, ip, comment, sort_key FROM entries WHERE group_id = ?2 AND domain = 'cp.test'",
+            params![gb, ga],
+        ).unwrap();
+        let entries = all_entries(&conn, pid).unwrap();
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn copy_entry_missing_domain_errors() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "dev", None);
+        let gid = insert_group(&conn, zid, "g", None);
+        let exists: bool = conn.query_row(
+            "SELECT count(*) FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?1 AND e.domain = ?2",
+            params![pid, "nonexistent"], |r| r.get::<_, i64>(0),
+        ).unwrap() > 0;
+        assert!(!exists);
+        let _gid = gid; // avoid unused warning
+    }
+
+    #[test]
+    fn edit_entry_updates_ip() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "z", None);
+        let gid = insert_group(&conn, zid, "g", None);
+        insert_entry(&conn, gid, "ed.test", "1.1.1.1", None);
+        conn.execute(
+            "UPDATE entries SET ip = ?1 WHERE id IN (SELECT e.id FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?2 AND e.domain = ?3)",
+            params!["9.9.9.9", pid, "ed.test"],
+        ).unwrap();
+        let entries = all_entries(&conn, pid).unwrap();
+        assert_eq!(entries[0].ip, "9.9.9.9");
+    }
+
+    #[test]
+    fn edit_entry_updates_comment() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let pid = active_profile(&conn).unwrap().id;
+        let zid = insert_zone(&conn, pid, "z", None);
+        let gid = insert_group(&conn, zid, "g", None);
+        insert_entry(&conn, gid, "ed.test", "1.1.1.1", Some("old comment"));
+        conn.execute(
+            "UPDATE entries SET comment = ?1 WHERE id IN (SELECT e.id FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?2 AND e.domain = ?3)",
+            params!["new comment", pid, "ed.test"],
+        ).unwrap();
+        let entries = all_entries(&conn, pid).unwrap();
+        assert_eq!(entries[0].comment.as_deref(), Some("new comment"));
+    }
+
+    #[test]
+    fn edit_entry_nonexistent_domain_errors() {
+        let (conn, _dir) = test_db();
+        insert_profile(&conn, "p", true);
+        let exists: bool = conn.query_row(
+            "SELECT count(*) FROM entries e JOIN groups g ON e.group_id = g.id JOIN zones z ON g.zone_id = z.id WHERE z.profile_id = ?1 AND e.domain = ?2",
+            params![1i64, "ghost.test"], |r| r.get::<_, i64>(0),
+        ).unwrap() > 0;
+        assert!(!exists);
     }
 
     // ═════════════════════════════════════════════════════════
