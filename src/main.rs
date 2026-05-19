@@ -1005,6 +1005,7 @@ Description=local-dns — Local DNS management
 After=network.target
 [Service]
 Type=simple
+RuntimeDirectory=local-dns
 ExecStart={} -k --conf-file={}/dnsmasq.conf
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
