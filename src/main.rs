@@ -204,6 +204,7 @@ enum Commands {
     Zone { #[command(subcommand)] action: ZoneAction },
     Group { #[command(subcommand)] action: GroupAction },
     Init,
+    Reset,
     Status,
     Apply,
     Logs { #[arg(short, long)] follow: bool, #[arg(short, long)] errors: bool, #[arg(short, long, default_value = "50")] lines: usize },
@@ -261,13 +262,14 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
         Commands::Zone { .. } => "zone",
         Commands::Group { .. } => "group",
         Commands::Init => "init",
+        Commands::Reset => "reset",
         Commands::Status => "status",
         Commands::Apply => "apply",
         Commands::Logs { .. } => "logs",
         Commands::Detect => "detect",
         Commands::Check { .. } => "check",
     };
-    let stats = if matches!(cmd_name, "init" | "status" | "detect") {
+    let stats = if matches!(cmd_name, "init" | "reset" | "status" | "detect") {
         vec![]
     } else {
         collect_tool_stats()
@@ -285,6 +287,7 @@ fn execute(cli: Cli, tel: &telemetry::Telemetry) -> Result<String, String> {
         Commands::Zone { action } => handle_zone(action),
         Commands::Group { action } => handle_group(action),
         Commands::Init => cmd_init(),
+        Commands::Reset => cmd_reset(),
         Commands::Status => cmd_status(),
         Commands::Apply => cmd_apply(),
         Commands::Logs { follow, errors, lines } => cmd_logs(follow, errors, lines),
@@ -578,6 +581,15 @@ fn cmd_init() -> Result<String, String> {
     println!("  {}  {}", "2.".green().bold(), "local-dns add myapp.test 127.0.0.1");
     println!("  {}  {}\n", "3.".green().bold(), "ping myapp.test");
     Ok(String::new())
+}
+
+fn cmd_reset() -> Result<String, String> {
+    let db = db_path();
+    if db.exists() {
+        fs::remove_file(&db).map_err(|e| format!("Cannot remove database: {e}"))?;
+        println!("{} Removed existing database.", "✓".green());
+    }
+    cmd_init()
 }
 
 fn start_service_hint() -> String {
