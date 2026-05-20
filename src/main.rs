@@ -847,17 +847,16 @@ fn cmd_check(domain: &str) -> Result<String, String> {
 }
 
 fn is_entry_loaded(domain: &str) -> bool {
-    let zones_conf = run_dir().join("zones.conf");
-    if !zones_conf.exists() {
+    let hosts_path = run_dir().join("hosts");
+    if !hosts_path.exists() {
         return false;
     }
-    fs::read_to_string(zones_conf)
+    fs::read_to_string(hosts_path)
         .ok()
         .map_or(false, |content| {
+            let clean = domain.trim_start_matches("*.");
             content.lines().any(|line| {
-                // Match address= pattern: /domain/ or /.domain/
-                let addr = format!("/{}{}", if domain.starts_with("*.") { "" } else { "" }, domain.trim_start_matches("*."));
-                line.contains(&addr)
+                line.split_whitespace().nth(1).map_or(false, |d| d == clean)
             })
         })
 }
@@ -930,12 +929,14 @@ fn cmd_apply() -> Result<String, String> {
     let conn = open_db()?; let p = active_profile(&conn)?; let entries = all_entries(&conn, p.id)?;
     ensure_run_dir()?;
     let mut lines: Vec<String> = entries.iter().map(|e| {
-        let core = if e.domain.starts_with("*.") { format!("/.{}/{}", e.domain.trim_start_matches("*."), e.ip) } else { format!("/{}/{}", e.domain, e.ip) };
-        let _tag = format!("[{}]", e.group_name); // zone name is implicit from dnsmasq conf-dir structure
-        match &e.comment { Some(c) => format!("address={core}  # {c} [{}/{}]", e.zone_name, e.group_name), None => format!("address={core}  # [{}/{}]", e.zone_name, e.group_name) }
+        let domain = e.domain.trim_start_matches("*.");
+        let _tag = format!("[{}]", e.group_name);
+        match &e.comment { Some(c) => format!("{}\t{domain}\t# {c} [{}/{}]", e.ip, e.zone_name, e.group_name), None => format!("{}\t{domain}\t# [{}/{}]", e.ip, e.zone_name, e.group_name) }
     }).collect();
+    lines.sort_by(|a, b| a.split_whitespace().nth(1).unwrap_or("").cmp(b.split_whitespace().nth(1).unwrap_or("")));
     lines.push(String::new());
-    fs::write(run_dir().join("zones.conf"), lines.join("\n")).map_err(|e| format!("{e}"))?;
+    let hosts_path = run_dir().join("hosts");
+    fs::write(hosts_path, lines.join("\n")).map_err(|e| format!("{e}"))?;
     reload_dnsmasq()?;
     Ok(format!("{} Applied '{}' ({} entries)", "✓".green(), p.name, entries.len().to_string().cyan()))
 }
@@ -1037,6 +1038,7 @@ port=5354
 bind-interfaces
 listen-address=127.0.0.1
 conf-dir={}
+addn-hosts={}/hosts
 domain-needed
 bogus-priv
 no-hosts
@@ -1046,7 +1048,7 @@ pid-file={}
 server={}#{}
 log-queries
 log-facility={}
-"#, run_dir().display(), pid_path().display(), state.upstream_dns, state.upstream_port, log_path().display());
+"#, run_dir().display(), run_dir().display(), pid_path().display(), state.upstream_dns, state.upstream_port, log_path().display());
     fs::write(data_dir().join("dnsmasq.conf"), &conf).map_err(|e| format!("Cannot write config: {e}"))
 }
 
